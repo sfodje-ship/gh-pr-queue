@@ -1,35 +1,473 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "Hello gh-pr-queue!"
+CONFIG_PATH="${GH_PR_QUEUE_CONFIG:-$HOME/.config/gh-pr-queue/config}"
+CUTOFF_DAYS=14
+ORGS=
+TEAMS_INCLUDE=
+TEAMS_EXCLUDE=
+TEAM_SIZE_GUARD=25
+PRIORITY="direct+teammate team"
 
-# Snippets to help get started:
+INCLUDE_DRAFTS=0
+ALL_PRS=0
+CURRENT_USER=
+CUTOFF_DATE=
+ORGS_SCOPE=
+SELECTED_TEAMS=
+TEAMMATES=
+RECORDS=
+FLAG_ORGS=()
+FLAG_TEAMS=()
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+SEARCH_JQ='(["__META__", (.total_count|tostring), (.incomplete_results|tostring), (.items|length|tostring)] | @tsv), (.items[] | [(.repository_url | split("/") | .[-2] + "/" + .[-1]), (.number|tostring), .created_at, (((now - (.created_at|fromdateiso8601)) / 86400) | floor | tostring), .user.login, (.title | gsub("[\r\n\t]"; " ")), .html_url] | @tsv)'
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+usage() {
+  cat <<'EOF'
+Usage: gh pr-queue [options]
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+Options:
+  --drafts          Include draft pull requests
+  --all             Disable the default created-date cutoff
+  --org ORG         Limit to an organization; repeatable
+  --team ORG/TEAM   Limit to a team slug; repeatable
+  --config PATH     Source an alternate config file
+  -h, --help        Show this help
+
+Config: ~/.config/gh-pr-queue/config
+  CUTOFF_DAYS=14
+  ORGS=
+  TEAMS_INCLUDE=
+  TEAMS_EXCLUDE=
+  TEAM_SIZE_GUARD=25
+  PRIORITY="direct+teammate team"
+EOF
+}
+
+die() {
+  printf 'gh-pr-queue: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'gh-pr-queue: %s\n' "$*" >&2
+}
+
+line_has() {
+  [ -n "$1" ] && printf '%s\n' "$1" | grep -Fxq "$2"
+}
+
+append_line() {
+  if [ -n "$1" ]; then
+    printf '%s\n%s' "$1" "$2"
+  else
+    printf '%s' "$2"
+  fi
+}
+
+append_unique_line() {
+  if line_has "$1" "$2"; then
+    printf '%s' "$1"
+  else
+    append_line "$1" "$2"
+  fi
+}
+
+csv_has() {
+  local list=$1 item=$2 old_ifs=$IFS part
+  [ -n "$list" ] || return 1
+  IFS=,
+  for part in $list; do
+    part=${part// /}
+    if [ "$part" = "$item" ]; then
+      IFS=$old_ifs
+      return 0
+    fi
+  done
+  IFS=$old_ifs
+  return 1
+}
+
+csv_to_lines() {
+  local list=$1 old_ifs=$IFS part out=
+  IFS=,
+  for part in $list; do
+    part=${part// /}
+    [ -n "$part" ] || continue
+    out=$(append_unique_line "$out" "$part")
+  done
+  IFS=$old_ifs
+  printf '%s' "$out"
+}
+
+join_csv() {
+  local out= item
+  for item in "$@"; do
+    if [ -n "$out" ]; then
+      out="${out},${item}"
+    else
+      out=$item
+    fi
+  done
+  printf '%s' "$out"
+}
+
+preparse_config_path() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --config)
+        [ "$#" -ge 2 ] || die "--config requires a path"
+        CONFIG_PATH=$2
+        shift
+        ;;
+      --config=*)
+        CONFIG_PATH=${1#*=}
+        ;;
+    esac
+    shift
+  done
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --drafts)
+        INCLUDE_DRAFTS=1
+        ;;
+      --all)
+        ALL_PRS=1
+        ;;
+      --org)
+        [ "$#" -ge 2 ] || die "--org requires an organization"
+        FLAG_ORGS[${#FLAG_ORGS[@]}]=$2
+        shift
+        ;;
+      --org=*)
+        FLAG_ORGS[${#FLAG_ORGS[@]}]=${1#*=}
+        ;;
+      --team)
+        [ "$#" -ge 2 ] || die "--team requires ORG/TEAM"
+        FLAG_TEAMS[${#FLAG_TEAMS[@]}]=$2
+        shift
+        ;;
+      --team=*)
+        FLAG_TEAMS[${#FLAG_TEAMS[@]}]=${1#*=}
+        ;;
+      --config)
+        shift
+        ;;
+      --config=*)
+        ;;
+      --self-check)
+        run_self_check
+        exit 0
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [ "${#FLAG_ORGS[@]}" -gt 0 ]; then
+    ORGS=$(join_csv "${FLAG_ORGS[@]}")
+  fi
+  if [ "${#FLAG_TEAMS[@]}" -gt 0 ]; then
+    TEAMS_INCLUDE=$(join_csv "${FLAG_TEAMS[@]}")
+  fi
+}
+
+validate_config() {
+  case "$CUTOFF_DAYS" in
+    ''|*[!0-9]*) die "CUTOFF_DAYS must be a non-negative integer" ;;
+  esac
+  case "$TEAM_SIZE_GUARD" in
+    ''|*[!0-9]*) die "TEAM_SIZE_GUARD must be a non-negative integer" ;;
+  esac
+
+  local tokens=${PRIORITY//+/ } token
+  for token in $tokens; do
+    case "$token" in
+      direct|teammate|team) ;;
+      *) die "unknown PRIORITY token: $token" ;;
+    esac
+  done
+}
+
+priority_wants() {
+  local tokens=${PRIORITY//+/ }
+  case " $tokens " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+source_in_tier() {
+  local tier=${1//+/ } source=$2 token
+  for token in $tier; do
+    [ "$token" = "$source" ] && return 0
+  done
+  return 1
+}
+
+load_user() {
+  local line
+  line=$(gh api user --jq '.login + "\t" + ((now - ('"$CUTOFF_DAYS"' * 86400)) | strftime("%Y-%m-%d"))')
+  CURRENT_USER=${line%%$'\t'*}
+  CUTOFF_DATE=${line#*$'\t'}
+}
+
+load_teams() {
+  local lines org slug count team_id
+  lines=$(gh api --paginate user/teams --jq '.[] | [.organization.login, .slug, ((.members_count // 0) | tostring)] | @tsv')
+
+  while IFS=$'\t' read -r org slug count; do
+    [ -n "${org:-}" ] || continue
+    team_id="${org}/${slug}"
+
+    if [ -n "$ORGS" ] && ! csv_has "$ORGS" "$org"; then
+      continue
+    fi
+    if [ -n "$TEAMS_INCLUDE" ] && ! csv_has "$TEAMS_INCLUDE" "$team_id"; then
+      continue
+    fi
+    if [ -n "$TEAMS_EXCLUDE" ] && csv_has "$TEAMS_EXCLUDE" "$team_id"; then
+      continue
+    fi
+
+    SELECTED_TEAMS=$(append_line "$SELECTED_TEAMS" "${org}"$'\t'"${slug}"$'\t'"${count}")
+    ORGS_SCOPE=$(append_unique_line "$ORGS_SCOPE" "$org")
+  done <<EOF
+$lines
+EOF
+
+  if [ -n "$ORGS" ]; then
+    ORGS_SCOPE=$(csv_to_lines "$ORGS")
+  fi
+}
+
+load_teammates() {
+  local org slug count members member
+
+  while IFS=$'\t' read -r org slug count; do
+    [ -n "${org:-}" ] || continue
+    if [ "$count" -gt "$TEAM_SIZE_GUARD" ]; then
+      warn "skipping teammate expansion for ${org}/${slug} (${count} members > guard ${TEAM_SIZE_GUARD}); team review requests still count. Raise TEAM_SIZE_GUARD or narrow TEAMS_INCLUDE to include it."
+      continue
+    fi
+
+    members=$(gh api --paginate "orgs/${org}/teams/${slug}/members" --jq '.[].login')
+    while IFS= read -r member; do
+      [ -n "$member" ] || continue
+      [ "$member" = "$CURRENT_USER" ] && continue
+      TEAMMATES=$(append_unique_line "$TEAMMATES" "$member")
+    done <<EOF
+$members
+EOF
+  done <<EOF
+$SELECTED_TEAMS
+EOF
+}
+
+draft_part() {
+  [ "$INCLUDE_DRAFTS" -eq 1 ] || printf ' draft:false'
+}
+
+cutoff_part() {
+  [ "$ALL_PRS" -eq 1 ] || printf ' created:>=%s' "$CUTOFF_DATE"
+}
+
+base_query() {
+  printf 'is:pr state:open%s%s' "$(draft_part)" "$(cutoff_part)"
+}
+
+record_pr() {
+  local source=$1 repo=$2 number=$3 created=$4 age=$5 author=$6 title=$7 url=$8
+  [ "$author" != "$CURRENT_USER" ] || return 0
+  if [ "$source" = "teammate" ] && ! line_has "$TEAMMATES" "$author"; then
+    return 0
+  fi
+  RECORDS=$(append_line "$RECORDS" "${source}"$'\t'"${repo}"$'\t'"${number}"$'\t'"${created}"$'\t'"${age}"$'\t'"${author}"$'\t'"${title}"$'\t'"${url}")
+}
+
+run_search() {
+  local source=$1 query=$2 page=1 output line tag total incomplete page_count
+  local repo number created age author title url
+
+  while [ "$page" -le 10 ]; do
+    output=$(gh api --method GET search/issues -f q="$query" -F per_page=100 -F page="$page" --jq "$SEARCH_JQ")
+    page_count=0
+
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$line" in
+        "__META__"$'\t'*)
+          IFS=$'\t' read -r tag total incomplete page_count <<EOF
+$line
+EOF
+          if [ "$page" -eq 1 ]; then
+            if [ "$incomplete" = "true" ]; then
+              warn "GitHub returned incomplete search results for: $query"
+            fi
+            if [ "$total" -gt 1000 ]; then
+              warn "GitHub caps search results at 1000 for: $query; use --org, a shorter CUTOFF_DAYS, or narrower team config."
+            fi
+          fi
+          ;;
+        *)
+          IFS=$'\t' read -r repo number created age author title url <<EOF
+$line
+EOF
+          [ -n "${repo:-}" ] || continue
+          record_pr "$source" "$repo" "$number" "$created" "$age" "$author" "$title" "$url"
+          ;;
+      esac
+    done <<EOF
+$output
+EOF
+
+    [ "$page_count" -eq 100 ] || break
+    page=$((page + 1))
+  done
+}
+
+fetch_direct() {
+  local org base
+  base=$(base_query)
+  if [ -n "$ORGS_SCOPE" ]; then
+    while IFS= read -r org; do
+      [ -n "$org" ] || continue
+      run_search direct "${base} user-review-requested:@me org:${org}"
+    done <<EOF
+$ORGS_SCOPE
+EOF
+  else
+    run_search direct "${base} user-review-requested:@me"
+  fi
+}
+
+fetch_team() {
+  local org slug count base
+  base=$(base_query)
+
+  if [ -n "$TEAMS_INCLUDE" ] || [ -n "$TEAMS_EXCLUDE" ]; then
+    while IFS=$'\t' read -r org slug count; do
+      [ -n "${org:-}" ] || continue
+      run_search team "${base} team-review-requested:${org}/${slug}"
+    done <<EOF
+$SELECTED_TEAMS
+EOF
+    return 0
+  fi
+
+  if [ -n "$ORGS_SCOPE" ]; then
+    while IFS= read -r org; do
+      [ -n "$org" ] || continue
+      run_search team "${base} team-review-requested-user:@me org:${org}"
+    done <<EOF
+$ORGS_SCOPE
+EOF
+  else
+    run_search team "${base} team-review-requested-user:@me"
+  fi
+}
+
+fetch_teammate() {
+  local org base
+  [ -n "$TEAMMATES" ] || return 0
+  [ -n "$ORGS_SCOPE" ] || return 0
+
+  base=$(base_query)
+  while IFS= read -r org; do
+    [ -n "$org" ] || continue
+    run_search teammate "${base} org:${org}"
+  done <<EOF
+$ORGS_SCOPE
+EOF
+}
+
+fetch_records() {
+  priority_wants teammate && load_teammates
+  priority_wants direct && fetch_direct
+  priority_wants team && fetch_team
+  priority_wants teammate && fetch_teammate
+}
+
+render_queue() {
+  local tier_num=1 emitted=0 seen= tier tier_label candidates record
+  local source repo number created age author title url key sorted
+
+  for tier in $PRIORITY; do
+    tier_label=${tier//+/ + }
+    candidates=
+
+    while IFS=$'\t' read -r source repo number created age author title url; do
+      [ -n "${source:-}" ] || continue
+      source_in_tier "$tier" "$source" || continue
+      key="${repo}#${number}"
+      line_has "$seen" "$key" && continue
+      candidates=$(append_line "$candidates" "${created}"$'\t'"${repo}"$'\t'"${number}"$'\t'"${age}"$'\t'"${author}"$'\t'"${title}"$'\t'"${url}")
+    done <<EOF
+$RECORDS
+EOF
+
+    if [ -n "$candidates" ]; then
+      printf 'Tier %s (%s)\n' "$tier_num" "$tier_label"
+      printf '%-30s %-6s %-5s %-18s %s\n' "REPO" "PR" "AGE" "AUTHOR" "TITLE"
+
+      sorted=$(printf '%s\n' "$candidates" | sort)
+      while IFS=$'\t' read -r created repo number age author title url; do
+        [ -n "${repo:-}" ] || continue
+        key="${repo}#${number}"
+        line_has "$seen" "$key" && continue
+        seen=$(append_unique_line "$seen" "$key")
+        printf '%-30s #%-5s %-5s %-18s %s\n' "$repo" "$number" "${age}d" "$author" "$title"
+        emitted=1
+      done <<EOF
+$sorted
+EOF
+      printf '\n'
+    fi
+
+    tier_num=$((tier_num + 1))
+  done
+
+  [ "$emitted" -eq 1 ] || printf 'No PRs in queue.\n'
+}
+
+run_self_check() {
+  CURRENT_USER=me
+  PRIORITY="direct+teammate team"
+  RECORDS=$'team\tacme/api\t9\t2026-01-04T00:00:00Z\t3\tpat\tTeam only\thttps://example.invalid/9\nteammate\tacme/api\t7\t2026-01-02T00:00:00Z\t5\tlee\t[DO NOT MERGE] Older\thttps://example.invalid/7\ndirect\tacme/app\t8\t2026-01-03T00:00:00Z\t4\tlee\tDirect newer\thttps://example.invalid/8\nteam\tacme/api\t7\t2026-01-02T00:00:00Z\t5\tlee\tDuplicate lower tier\thttps://example.invalid/7'
+
+  local out order dupes
+  out=$(render_queue)
+  printf '%s\n' "$out" | grep -Fq 'Tier 1 (direct + teammate)' || die "self-check failed: missing merged tier"
+  printf '%s\n' "$out" | grep -Fq '[DO NOT MERGE] Older' || die "self-check failed: missing title annotation"
+  dupes=$(printf '%s\n' "$out" | grep -Fc '#7')
+  [ "$dupes" -eq 1 ] || die "self-check failed: duplicate PR was not removed"
+  order=$(printf '%s\n' "$out" | grep -E '#(7|8|9)' | sed 's/.*#\([0-9][0-9]*\).*/\1/' | tr '\n' ' ')
+  [ "$order" = "7 8 9 " ] || die "self-check failed: expected oldest-first tier order, got: $order"
+  printf 'self-check ok\n'
+}
+
+main() {
+  preparse_config_path "$@"
+  if [ -f "$CONFIG_PATH" ]; then
+    # The config file is intentionally shell syntax: KEY=VALUE.
+    # shellcheck source=/dev/null
+    . "$CONFIG_PATH"
+  fi
+  parse_args "$@"
+  validate_config
+  load_user
+  load_teams
+  fetch_records
+  render_queue
+}
+
+main "$@"
