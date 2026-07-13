@@ -429,8 +429,8 @@ label_tier() {
 }
 
 render_queue() {
-  local emitted=0 seen= tier tier_label candidates record
-  local source repo number created age author title url key sorted display_repo
+  local total=0 seen= tier tier_label candidates record tier_has_rows body=
+  local source repo number created age author title url key sorted display_repo suffix count_word
 
   for tier in $PRIORITY; do
     tier_label=$(label_tier "$tier")
@@ -447,7 +447,11 @@ $RECORDS
 EOF
 
     if [ -n "$candidates" ]; then
-      printf '%s\n' "$tier_label"
+      if [ -n "$body" ]; then
+        body+=$'\n\n'
+      fi
+      body+="$tier_label"
+      tier_has_rows=0
 
       sorted=$(printf '%s\n' "$candidates" | sort)
       while IFS=$'\t' read -r created repo number age author title url; do
@@ -456,16 +460,29 @@ EOF
         line_has "$seen" "$key" && continue
         seen=$(append_unique_line "$seen" "$key")
         display_repo=${repo#*/}
-        printf '  %s#%s  %sd  %s  %s\n' "$display_repo" "$number" "$age" "$author" "$title"
-        emitted=1
+        if [ "$tier_has_rows" -eq 1 ]; then
+          body+=$'\n'
+        fi
+        body+=$'\n'"  ${display_repo}#${number}  ${age}d  ${author}"
+        body+=$'\n'"    ${title}"
+        tier_has_rows=1
+        total=$((total + 1))
       done <<EOF
 $sorted
 EOF
-      printf '\n'
     fi
   done
 
-  [ "$emitted" -eq 1 ] || printf 'No PRs in queue.\n'
+  if [ "$total" -eq 0 ]; then
+    printf 'No PRs in queue.\n'
+    return 0
+  fi
+
+  suffix=
+  [ "$ALL_PRS" -eq 1 ] || suffix=" (${CUTOFF_DAYS}d cutoff)"
+  count_word=PRs
+  [ "$total" -eq 1 ] && count_word=PR
+  printf '%s %s need review%s\n\n%s\n' "$total" "$count_word" "$suffix" "$body"
 }
 
 run_self_check() {
