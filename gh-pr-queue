@@ -435,7 +435,7 @@ label_tier() {
 
 render_queue() {
   local total=0 seen= tier tier_label candidates record tier_has_rows body=
-  local source repo number created age author title url key sorted display_repo suffix count_word
+  local source repo number created age author title url key sorted display_repo suffix count_word url_width scan_seen row
 
   for tier in $PRIORITY; do
     tier_label=$(label_tier "$tier")
@@ -459,6 +459,22 @@ EOF
       tier_has_rows=0
 
       sorted=$(printf '%s\n' "$candidates" | sort)
+      if [ "$VERBOSE" -eq 0 ]; then
+        url_width=2
+        scan_seen=$seen
+        while IFS=$'\t' read -r created repo number age author title url; do
+          [ -n "${repo:-}" ] || continue
+          key="${repo}#${number}"
+          line_has "$scan_seen" "$key" && continue
+          [ "${#url}" -gt "$url_width" ] && url_width=${#url}
+          scan_seen=$(append_unique_line "$scan_seen" "$key")
+        done <<EOF
+$sorted
+EOF
+        printf -v row '  %-*s  %s' "$url_width" "PR" "AUTHOR"
+        body+=$'\n'"$row"
+      fi
+
       while IFS=$'\t' read -r created repo number age author title url; do
         [ -n "${repo:-}" ] || continue
         key="${repo}#${number}"
@@ -472,7 +488,8 @@ EOF
           body+=$'\n'"  ${display_repo}#${number}  ${age}d  ${author}"
           body+=$'\n'"    ${title}"
         else
-          body+=$'\n'"  ${url}  @${author}"
+          printf -v row '  %-*s  @%s' "$url_width" "$url" "$author"
+          body+=$'\n'"$row"
         fi
         tier_has_rows=1
         total=$((total + 1))
@@ -501,7 +518,8 @@ run_self_check() {
 
   local out order dupes
   out=$(render_queue)
-  printf '%s\n' "$out" | grep -Fq 'https://example.invalid/7  @lee' || die "self-check failed: compact output missing PR link + author"
+  printf '%s\n' "$out" | grep -Fq 'PR                         AUTHOR' || die "self-check failed: compact output missing table header"
+  printf '%s\n' "$out" | grep -Eq 'https://example.invalid/7 +@lee' || die "self-check failed: compact output missing PR link + author"
   ! printf '%s\n' "$out" | grep -Fq '[DO NOT MERGE] Older' || die "self-check failed: compact output included title"
 
   VERBOSE=1
