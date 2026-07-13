@@ -12,6 +12,7 @@ PRIORITY=$DEFAULT_PRIORITY
 
 INCLUDE_DRAFTS=0
 ALL_PRS=0
+VERBOSE=0
 CURRENT_USER=
 CUTOFF_DATE=
 ORGS_SCOPE=
@@ -30,6 +31,7 @@ Usage: gh pr-queue [options]
 Options:
   --drafts          Include draft pull requests
   --all             Disable the default created-date cutoff
+  --verbose         Include age, author, and title details
   --org ORG         Limit to an organization; repeatable
   --team ORG/TEAM   Limit to a team slug and include teammate-authored PRs; repeatable
   --config PATH     Source an alternate config file
@@ -137,6 +139,9 @@ parse_args() {
         ;;
       --all)
         ALL_PRS=1
+        ;;
+      --verbose)
+        VERBOSE=1
         ;;
       --org)
         [ "$#" -ge 2 ] || die "--org requires an organization"
@@ -460,11 +465,15 @@ EOF
         line_has "$seen" "$key" && continue
         seen=$(append_unique_line "$seen" "$key")
         display_repo=${repo#*/}
-        if [ "$tier_has_rows" -eq 1 ]; then
+        if [ "$tier_has_rows" -eq 1 ] && [ "$VERBOSE" -eq 1 ]; then
           body+=$'\n'
         fi
-        body+=$'\n'"  ${display_repo}#${number}  ${age}d  ${author}"
-        body+=$'\n'"    ${title}"
+        if [ "$VERBOSE" -eq 1 ]; then
+          body+=$'\n'"  ${display_repo}#${number}  ${age}d  ${author}"
+          body+=$'\n'"    ${title}"
+        else
+          body+=$'\n'"  ${url}  @${author}"
+        fi
         tier_has_rows=1
         total=$((total + 1))
       done <<EOF
@@ -492,12 +501,18 @@ run_self_check() {
 
   local out order dupes
   out=$(render_queue)
+  printf '%s\n' "$out" | grep -Fq 'https://example.invalid/7  @lee' || die "self-check failed: compact output missing PR link + author"
+  ! printf '%s\n' "$out" | grep -Fq '[DO NOT MERGE] Older' || die "self-check failed: compact output included title"
+
+  VERBOSE=1
+  out=$(render_queue)
   printf '%s\n' "$out" | grep -Fq 'direct requests + teammate-authored' || die "self-check failed: missing merged tier"
   printf '%s\n' "$out" | grep -Fq '[DO NOT MERGE] Older' || die "self-check failed: missing title annotation"
   dupes=$(printf '%s\n' "$out" | grep -Fc '#7')
   [ "$dupes" -eq 1 ] || die "self-check failed: duplicate PR was not removed"
   order=$(printf '%s\n' "$out" | grep -E '#(7|8|9)' | sed 's/.*#\([0-9][0-9]*\).*/\1/' | tr '\n' ' ')
   [ "$order" = "7 8 9 " ] || die "self-check failed: expected oldest-first tier order, got: $order"
+  VERBOSE=0
 
   RECORDS=
   gh() {
