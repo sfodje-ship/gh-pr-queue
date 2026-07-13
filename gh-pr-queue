@@ -7,7 +7,8 @@ ORGS=
 TEAMS_INCLUDE=
 TEAMS_EXCLUDE=
 TEAM_SIZE_GUARD=25
-PRIORITY="direct+teammate team"
+DEFAULT_PRIORITY="direct team"
+PRIORITY=$DEFAULT_PRIORITY
 
 INCLUDE_DRAFTS=0
 ALL_PRS=0
@@ -30,7 +31,7 @@ Options:
   --drafts          Include draft pull requests
   --all             Disable the default created-date cutoff
   --org ORG         Limit to an organization; repeatable
-  --team ORG/TEAM   Limit to a team slug; repeatable
+  --team ORG/TEAM   Limit to a team slug and include teammate-authored PRs; repeatable
   --config PATH     Source an alternate config file
   -h, --help        Show this help
 
@@ -40,7 +41,7 @@ Config: ~/.config/gh-pr-queue/config
   TEAMS_INCLUDE=
   TEAMS_EXCLUDE=
   TEAM_SIZE_GUARD=25
-  PRIORITY="direct+teammate team"
+  PRIORITY="direct team"
 EOF
 }
 
@@ -179,6 +180,9 @@ parse_args() {
   if [ "${#FLAG_TEAMS[@]}" -gt 0 ]; then
     TEAMS_INCLUDE=$(join_csv "${FLAG_TEAMS[@]}")
   fi
+  if [ -n "$TEAMS_INCLUDE" ] && [ "$PRIORITY" = "$DEFAULT_PRIORITY" ]; then
+    PRIORITY="direct+teammate team"
+  fi
 }
 
 validate_config() {
@@ -287,10 +291,13 @@ base_query() {
 
 record_pr() {
   local source=$1 repo=$2 number=$3 created=$4 age=$5 author=$6 title=$7 url=$8
+  local latest_review_state
   [ "$author" != "$CURRENT_USER" ] || return 0
   if [ "$source" = "teammate" ] && ! line_has "$TEAMMATES" "$author"; then
     return 0
   fi
+  latest_review_state=$(gh api "repos/${repo}/pulls/${number}/reviews" --jq ".[] | select(.user.login == \"${CURRENT_USER}\" and (.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")) | .state" | tail -n 1)
+  [ "$latest_review_state" = "APPROVED" ] && return 0
   RECORDS=$(append_line "$RECORDS" "${source}"$'\t'"${repo}"$'\t'"${number}"$'\t'"${created}"$'\t'"${age}"$'\t'"${author}"$'\t'"${title}"$'\t'"${url}")
 }
 
@@ -348,6 +355,7 @@ EOF
   else
     run_search direct "${base} user-review-requested:@me"
   fi
+  return 0
 }
 
 fetch_team() {
@@ -374,6 +382,7 @@ EOF
   else
     run_search team "${base} team-review-requested-user:@me"
   fi
+  return 0
 }
 
 fetch_teammate() {
@@ -388,21 +397,43 @@ fetch_teammate() {
   done <<EOF
 $ORGS_SCOPE
 EOF
+  return 0
 }
 
 fetch_records() {
-  priority_wants teammate && load_teammates
+  if priority_wants teammate && [ -n "$TEAMS_INCLUDE" ]; then
+    load_teammates
+  fi
   priority_wants direct && fetch_direct
   priority_wants team && fetch_team
-  priority_wants teammate && fetch_teammate
+  [ -n "$TEAMMATES" ] && fetch_teammate
+  return 0
+}
+
+label_tier() {
+  local raw=${1//+/ } token out= label
+  for token in $raw; do
+    case "$token" in
+      direct) label="direct requests" ;;
+      teammate) label="teammate-authored" ;;
+      team) label="team requests" ;;
+      *) label=$token ;;
+    esac
+    if [ -n "$out" ]; then
+      out="${out} + ${label}"
+    else
+      out=$label
+    fi
+  done
+  printf '%s' "$out"
 }
 
 render_queue() {
-  local tier_num=1 emitted=0 seen= tier tier_label candidates record
-  local source repo number created age author title url key sorted
+  local emitted=0 seen= tier tier_label candidates record
+  local source repo number created age author title url key sorted display_repo
 
   for tier in $PRIORITY; do
-    tier_label=${tier//+/ + }
+    tier_label=$(label_tier "$tier")
     candidates=
 
     while IFS=$'\t' read -r source repo number created age author title url; do
@@ -416,8 +447,7 @@ $RECORDS
 EOF
 
     if [ -n "$candidates" ]; then
-      printf 'Tier %s (%s)\n' "$tier_num" "$tier_label"
-      printf '%-30s %-6s %-5s %-18s %s\n' "REPO" "PR" "AGE" "AUTHOR" "TITLE"
+      printf '%s\n' "$tier_label"
 
       sorted=$(printf '%s\n' "$candidates" | sort)
       while IFS=$'\t' read -r created repo number age author title url; do
@@ -425,15 +455,14 @@ EOF
         key="${repo}#${number}"
         line_has "$seen" "$key" && continue
         seen=$(append_unique_line "$seen" "$key")
-        printf '%-30s #%-5s %-5s %-18s %s\n' "$repo" "$number" "${age}d" "$author" "$title"
+        display_repo=${repo#*/}
+        printf '  %s#%s  %sd  %s  %s\n' "$display_repo" "$number" "$age" "$author" "$title"
         emitted=1
       done <<EOF
 $sorted
 EOF
       printf '\n'
     fi
-
-    tier_num=$((tier_num + 1))
   done
 
   [ "$emitted" -eq 1 ] || printf 'No PRs in queue.\n'
@@ -446,12 +475,26 @@ run_self_check() {
 
   local out order dupes
   out=$(render_queue)
-  printf '%s\n' "$out" | grep -Fq 'Tier 1 (direct + teammate)' || die "self-check failed: missing merged tier"
+  printf '%s\n' "$out" | grep -Fq 'direct requests + teammate-authored' || die "self-check failed: missing merged tier"
   printf '%s\n' "$out" | grep -Fq '[DO NOT MERGE] Older' || die "self-check failed: missing title annotation"
   dupes=$(printf '%s\n' "$out" | grep -Fc '#7')
   [ "$dupes" -eq 1 ] || die "self-check failed: duplicate PR was not removed"
   order=$(printf '%s\n' "$out" | grep -E '#(7|8|9)' | sed 's/.*#\([0-9][0-9]*\).*/\1/' | tr '\n' ' ')
   [ "$order" = "7 8 9 " ] || die "self-check failed: expected oldest-first tier order, got: $order"
+
+  RECORDS=
+  gh() {
+    case "$2" in
+      repos/acme/app/pulls/42/reviews) printf 'APPROVED\n' ;;
+      repos/acme/app/pulls/43/reviews) ;;
+      *) return 1 ;;
+    esac
+  }
+  record_pr direct acme/app 42 2026-01-01T00:00:00Z 6 lee "Approved" https://example.invalid/42
+  record_pr direct acme/app 43 2026-01-01T00:00:00Z 6 lee "Needs review" https://example.invalid/43
+  unset -f gh
+  printf '%s\n' "$RECORDS" | grep -Fq $'\t43\t' || die "self-check failed: unapproved PR was not recorded"
+  ! printf '%s\n' "$RECORDS" | grep -Fq $'\t42\t' || die "self-check failed: approved PR was not filtered"
   printf 'self-check ok\n'
 }
 
