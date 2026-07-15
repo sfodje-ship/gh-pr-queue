@@ -8,6 +8,7 @@ TEAMS_INCLUDE=
 TEAMS_EXCLUDE=
 TEAMMATE_TEAMS=
 TEAM_SIZE_GUARD=25
+SKIP_TEAM_APPROVED=0
 DEFAULT_PRIORITY="direct team"
 PRIORITY=$DEFAULT_PRIORITY
 
@@ -37,13 +38,14 @@ usage() {
 Usage: gh pr-queue [options]
 
 Options:
-  --drafts          Include draft pull requests
-  --all             Disable the default created-date cutoff
-  --verbose         Include age, author, and title details
-  --org ORG         Limit to an organization; repeatable
-  --team ORG/TEAM   Limit to a team slug and include teammate-authored PRs; repeatable
-  --config PATH     Source an alternate config file
-  -h, --help        Show this help
+  --drafts              Include draft pull requests
+  --all                 Disable the default created-date cutoff
+  --skip-team-approved  Also hide PRs a teammate has approved
+  --verbose             Include age, author, and title details
+  --org ORG             Limit to an organization; repeatable
+  --team ORG/TEAM       Limit to a team slug and include teammate-authored PRs; repeatable
+  --config PATH         Source an alternate config file
+  -h, --help            Show this help
 
 Config: ~/.config/gh-pr-queue/config
   CUTOFF_DAYS=14
@@ -52,6 +54,7 @@ Config: ~/.config/gh-pr-queue/config
   TEAMS_EXCLUDE=
   TEAMMATE_TEAMS=
   TEAM_SIZE_GUARD=25
+  SKIP_TEAM_APPROVED=0
   PRIORITY="direct team"
 EOF
 }
@@ -152,6 +155,9 @@ parse_args() {
       --verbose)
         VERBOSE=1
         ;;
+      --skip-team-approved)
+        SKIP_TEAM_APPROVED=1
+        ;;
       --org)
         [ "$#" -ge 2 ] || die "--org requires an organization"
         FLAG_ORGS[${#FLAG_ORGS[@]}]=$2
@@ -207,6 +213,10 @@ validate_config() {
   esac
   case "$TEAM_SIZE_GUARD" in
     ''|*[!0-9]*) die "TEAM_SIZE_GUARD must be a non-negative integer" ;;
+  esac
+  case "$SKIP_TEAM_APPROVED" in
+    0|1) ;;
+    *) die "SKIP_TEAM_APPROVED must be 0 or 1" ;;
   esac
 
   local tokens=${PRIORITY//+/ } token
@@ -328,16 +338,30 @@ record_pr() {
 }
 
 flush_review_chunk() {
-  local out alias state idx key
+  local out alias my_state approvers idx key login
   [ -n "$CHUNK" ] || return 0
-  out=$(gh api graphql -f query="query {${CHUNK} }" --jq '.data | to_entries[] | [.key, (.value.pullRequest.reviews.nodes[0].state // "-")] | @tsv')
-  while IFS=$'\t' read -r alias state; do
+  out=$(gh api graphql -f query="query {${CHUNK} }" --jq '.data | to_entries[] | [.key, (.value.pullRequest.mine.nodes[0].state // "-"), ((.value.pullRequest.team.nodes // []) | map(.author.login // "-") | join(","))] | @tsv')
+  while IFS=$'\t' read -r alias my_state approvers; do
     [ -n "${alias:-}" ] || continue
-    [ "$state" = "APPROVED" ] || continue
     idx=${alias#q}
     key=$(printf '%s\n' "$CHUNK_KEYS" | sed -n "$((idx + 1))p")
     [ -n "$key" ] || continue
-    APPROVED_KEYS=$(append_unique_line "$APPROVED_KEYS" "$key")
+    if [ "$my_state" = "APPROVED" ]; then
+      APPROVED_KEYS=$(append_unique_line "$APPROVED_KEYS" "$key")
+      continue
+    fi
+    # Your own CHANGES_REQUESTED outranks a teammate's approval.
+    [ "$my_state" = "CHANGES_REQUESTED" ] && continue
+    [ -n "$approvers" ] || continue
+    while IFS= read -r login; do
+      [ -n "$login" ] || continue
+      if line_has "$TEAMMATES" "$login"; then
+        APPROVED_KEYS=$(append_unique_line "$APPROVED_KEYS" "$key")
+        break
+      fi
+    done <<EOF2
+$(csv_to_lines "$approvers")
+EOF2
   done <<EOF
 $out
 EOF
@@ -352,7 +376,17 @@ EOF
 # many reviews the PR has.
 filter_approved() {
   [ -n "$RECORDS" ] || return 0
-  local keys= source repo number created age author title url key owner name filtered=
+  local keys= source repo number created age author title url key owner name filtered= team_sel=
+
+  if [ "$SKIP_TEAM_APPROVED" -eq 1 ]; then
+    if [ -n "$TEAMMATES" ]; then
+      # Dismissed approvals flip to DISMISSED, so states: [APPROVED] returns
+      # only active approvals.
+      team_sel=" team: reviews(last: 30, states: [APPROVED]) { nodes { author { login } } }"
+    else
+      warn "--skip-team-approved has no teammates to check; set TEAMMATE_TEAMS or --team"
+    fi
+  fi
 
   while IFS=$'\t' read -r source repo number created age author title url; do
     [ -n "${source:-}" ] || continue
@@ -371,7 +405,7 @@ EOF
     number=${key##*"#"}
     owner=${repo%%/*}
     name=${repo#*/}
-    CHUNK="${CHUNK} q${CHUNK_COUNT}: repository(owner: \"${owner}\", name: \"${name}\") { pullRequest(number: ${number}) { reviews(last: 1, author: \"${CURRENT_USER}\", states: [APPROVED, CHANGES_REQUESTED]) { nodes { state } } } }"
+    CHUNK="${CHUNK} q${CHUNK_COUNT}: repository(owner: \"${owner}\", name: \"${name}\") { pullRequest(number: ${number}) { mine: reviews(last: 1, author: \"${CURRENT_USER}\", states: [APPROVED, CHANGES_REQUESTED]) { nodes { state } }${team_sel} } }"
     CHUNK_KEYS=$(append_line "$CHUNK_KEYS" "$key")
     CHUNK_COUNT=$((CHUNK_COUNT + 1))
     [ "$CHUNK_COUNT" -lt 50 ] || flush_review_chunk
@@ -633,20 +667,29 @@ run_self_check() {
   VERBOSE=0
 
   RECORDS=
-  record_pr direct acme/app 42 2026-01-01T00:00:00Z 6 lee "Approved" https://example.invalid/42
-  record_pr direct acme/app 43 2026-01-01T00:00:00Z 6 lee "Needs review" https://example.invalid/43
+  TEAMMATES=lee
+  SKIP_TEAM_APPROVED=1
+  record_pr direct acme/app 42 2026-01-01T00:00:00Z 6 lee "I approved" https://example.invalid/42
+  record_pr direct acme/app 43 2026-01-01T00:00:00Z 6 lee "No reviews" https://example.invalid/43
   record_pr team acme/app 42 2026-01-01T00:00:00Z 6 lee "Approved dupe" https://example.invalid/42
+  record_pr direct acme/app 44 2026-01-01T00:00:00Z 6 lee "Teammate approved" https://example.invalid/44
+  record_pr direct acme/app 45 2026-01-01T00:00:00Z 6 lee "My changes requested" https://example.invalid/45
+  record_pr direct acme/app 46 2026-01-01T00:00:00Z 6 lee "Outsider approved" https://example.invalid/46
   GH_CALL_LOG=$(mktemp)
   gh() {
     printf '.' >>"$GH_CALL_LOG"
-    printf 'q0\tAPPROVED\nq1\t-\n'
+    printf 'q0\tAPPROVED\t\nq1\t-\t\nq2\t-\tlee\nq3\tCHANGES_REQUESTED\tlee\nq4\t-\tstranger\n'
   }
   filter_approved
   unset -f gh
   [ "$(wc -c <"$GH_CALL_LOG")" -eq 1 ] || die "self-check failed: expected one batched review query"
   rm -f "$GH_CALL_LOG"
-  printf '%s\n' "$RECORDS" | grep -Fq $'\t43\t' || die "self-check failed: unapproved PR was not kept"
-  ! printf '%s\n' "$RECORDS" | grep -Fq $'\t42\t' || die "self-check failed: approved PR was not filtered from all tiers"
+  printf '%s\n' "$RECORDS" | grep -Fq $'\t43\t' || die "self-check failed: unreviewed PR was not kept"
+  ! printf '%s\n' "$RECORDS" | grep -Fq $'\t42\t' || die "self-check failed: self-approved PR was not filtered from all tiers"
+  ! printf '%s\n' "$RECORDS" | grep -Fq $'\t44\t' || die "self-check failed: teammate-approved PR was not filtered"
+  printf '%s\n' "$RECORDS" | grep -Fq $'\t45\t' || die "self-check failed: my CHANGES_REQUESTED should outrank teammate approval"
+  printf '%s\n' "$RECORDS" | grep -Fq $'\t46\t' || die "self-check failed: outsider approval should not filter"
+  SKIP_TEAM_APPROVED=0
 
   TEAMMATES=$'ann\nbob'
   ORGS_SCOPE=acme

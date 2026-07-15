@@ -26,6 +26,7 @@ gh pr-queue [options]
 | `--drafts` | Include draft pull requests |
 | `--all` | Disable the created-date cutoff (default: last `CUTOFF_DAYS` days) |
 | `--verbose` | Show age, author, and title per PR instead of the compact table |
+| `--skip-team-approved` | Also hide PRs a teammate has already approved (needs `TEAMMATE_TEAMS` or `--team`) |
 | `--org ORG` | Limit to an organization; repeatable |
 | `--team ORG/TEAM` | Limit to a team and include teammate-authored PRs; repeatable |
 | `--config PATH` | Source an alternate config file |
@@ -61,6 +62,7 @@ Command-line flags override config file values. All keys are optional.
 | `TEAMS_EXCLUDE` | _(none)_ | Comma-separated `ORG/TEAM` slugs whose review requests are never shown. |
 | `TEAMMATE_TEAMS` | _(none)_ | Comma-separated `ORG/TEAM` slugs whose members' PRs count as teammate-authored. Unlike `TEAMS_INCLUDE`, does not narrow which team review requests are shown — use this to float your immediate team's PRs to the top while still seeing every team request. |
 | `TEAM_SIZE_GUARD` | `25` | Teams with more members than this are not expanded into teammates (guards against org-wide umbrella teams). A warning names any team it skips. |
+| `SKIP_TEAM_APPROVED` | `0` | Set to `1` to also hide PRs with an active approval from any teammate — useful when one team approval means the PR no longer needs you. Same as `--skip-team-approved`. Your own `CHANGES_REQUESTED` keeps the PR visible, and dismissed approvals don't count. Requires teammates from `TEAMMATE_TEAMS` or `--team`. |
 | `PRIORITY` | `direct team` | Tier order as space-separated tokens (`direct`, `teammate`, `team`); `+` merges tokens into one tier — see [Priority tiers](#priority-tiers). |
 
 Example — see all team requests, but float your own team's PRs to the top:
