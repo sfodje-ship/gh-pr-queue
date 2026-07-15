@@ -2,13 +2,18 @@
 
 A [gh CLI](https://cli.github.com/) extension that lists open pull requests waiting on your review, grouped into priority tiers and stripped of noise: PRs you authored, PRs you already approved, and duplicates across tiers are removed.
 
+## Requirements
+
+- [gh CLI](https://cli.github.com/) 2.0+ — `brew install gh` (macOS) or see [installation docs](https://github.com/cli/cli#installation) for other platforms
+- Authenticated session: `gh auth login`
+
+Verify both with `gh auth status`.
+
 ## Install
 
 ```sh
 gh extension install sfodje-ship/gh-pr-queue
 ```
-
-Requires an authenticated `gh` (`gh auth login`).
 
 ## Usage
 
