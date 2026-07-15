@@ -6,6 +6,7 @@ CUTOFF_DAYS=14
 ORGS=
 TEAMS_INCLUDE=
 TEAMS_EXCLUDE=
+TEAMMATE_TEAMS=
 TEAM_SIZE_GUARD=25
 DEFAULT_PRIORITY="direct team"
 PRIORITY=$DEFAULT_PRIORITY
@@ -42,6 +43,7 @@ Config: ~/.config/gh-pr-queue/config
   ORGS=
   TEAMS_INCLUDE=
   TEAMS_EXCLUDE=
+  TEAMMATE_TEAMS=
   TEAM_SIZE_GUARD=25
   PRIORITY="direct team"
 EOF
@@ -185,7 +187,9 @@ parse_args() {
   if [ "${#FLAG_TEAMS[@]}" -gt 0 ]; then
     TEAMS_INCLUDE=$(join_csv "${FLAG_TEAMS[@]}")
   fi
-  if [ -n "$TEAMS_INCLUDE" ] && [ "$PRIORITY" = "$DEFAULT_PRIORITY" ]; then
+  if [ -n "$TEAMMATE_TEAMS" ] && [ "$PRIORITY" = "$DEFAULT_PRIORITY" ]; then
+    PRIORITY="direct teammate team"
+  elif [ -n "$TEAMS_INCLUDE" ] && [ "$PRIORITY" = "$DEFAULT_PRIORITY" ]; then
     PRIORITY="direct+teammate team"
   fi
 }
@@ -260,10 +264,14 @@ EOF
 }
 
 load_teammates() {
-  local org slug count members member
+  local org slug count members member matched= team_id
 
   while IFS=$'\t' read -r org slug count; do
     [ -n "${org:-}" ] || continue
+    if [ -n "$TEAMMATE_TEAMS" ] && ! csv_has "$TEAMMATE_TEAMS" "${org}/${slug}"; then
+      continue
+    fi
+    matched=$(append_unique_line "$matched" "${org}/${slug}")
     if [ "$count" -gt "$TEAM_SIZE_GUARD" ]; then
       warn "skipping teammate expansion for ${org}/${slug} (${count} members > guard ${TEAM_SIZE_GUARD}); team review requests still count. Raise TEAM_SIZE_GUARD or narrow TEAMS_INCLUDE to include it."
       continue
@@ -280,6 +288,15 @@ EOF
   done <<EOF
 $SELECTED_TEAMS
 EOF
+
+  if [ -n "$TEAMMATE_TEAMS" ]; then
+    while IFS= read -r team_id; do
+      [ -n "$team_id" ] || continue
+      line_has "$matched" "$team_id" || warn "TEAMMATE_TEAMS team not found among your teams: ${team_id}"
+    done <<EOF
+$(csv_to_lines "$TEAMMATE_TEAMS")
+EOF
+  fi
 }
 
 draft_part() {
@@ -406,7 +423,7 @@ EOF
 }
 
 fetch_records() {
-  if priority_wants teammate && [ -n "$TEAMS_INCLUDE" ]; then
+  if priority_wants teammate && { [ -n "$TEAMMATE_TEAMS" ] || [ -n "$TEAMS_INCLUDE" ]; }; then
     load_teammates
   fi
   priority_wants direct && fetch_direct
