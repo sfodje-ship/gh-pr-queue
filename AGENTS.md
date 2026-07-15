@@ -20,7 +20,7 @@ Multi-line data is carried in newline-separated string variables (`RECORDS`, `SE
 
 `main` runs: `preparse_config_path` → source config → `parse_args` → `validate_config` → `load_user` → `load_teams` → `fetch_records` → `render_queue`.
 
-`fetch_records` runs one GitHub search per tier/org (`fetch_direct`, `fetch_team`, `fetch_teammate`); each hit goes through `record_pr`, which drops PRs authored by the current user, non-teammate authors in the teammate tier, and PRs whose latest review by the current user is `APPROVED`. Surviving PRs append to `RECORDS` as tab-separated lines with fields: source, repo, number, created, age, author, title, url.
+`fetch_records` runs one GitHub search per tier/org (`fetch_direct`, `fetch_team`, `fetch_teammate` — the last ORs `author:` qualifiers into the query, chunked under `QUERY_LIMIT`); each hit goes through `record_pr`, which drops PRs authored by the current user and non-teammate authors in the teammate tier. Surviving PRs append to `RECORDS` as tab-separated lines with fields: source, repo, number, created, age, author, title, url. `filter_approved` then batches all unique PRs into aliased GraphQL queries (50 per call) and removes any whose latest review by the current user is `APPROVED`.
 
 `render_queue` walks `PRIORITY` tiers in order and dedupes on `repo#number` — a PR renders in the first tier that claims it.
 

@@ -20,8 +20,15 @@ ORGS_SCOPE=
 SELECTED_TEAMS=
 TEAMMATES=
 RECORDS=
+CHUNK=
+CHUNK_KEYS=
+CHUNK_COUNT=0
+APPROVED_KEYS=
 FLAG_ORGS=()
 FLAG_TEAMS=()
+
+# GitHub search rejects queries longer than 256 characters.
+QUERY_LIMIT=256
 
 SEARCH_JQ='(["__META__", (.total_count|tostring), (.incomplete_results|tostring), (.items|length|tostring)] | @tsv), (.items[] | [(.repository_url | split("/") | .[-2] + "/" + .[-1]), (.number|tostring), .created_at, (((now - (.created_at|fromdateiso8601)) / 86400) | floor | tostring), .user.login, (.title | gsub("[\r\n\t]"; " ")), .html_url] | @tsv)'
 
@@ -313,14 +320,74 @@ base_query() {
 
 record_pr() {
   local source=$1 repo=$2 number=$3 created=$4 age=$5 author=$6 title=$7 url=$8
-  local latest_review_state
   [ "$author" != "$CURRENT_USER" ] || return 0
   if [ "$source" = "teammate" ] && ! line_has "$TEAMMATES" "$author"; then
     return 0
   fi
-  latest_review_state=$(gh api "repos/${repo}/pulls/${number}/reviews" --jq ".[] | select(.user.login == \"${CURRENT_USER}\" and (.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")) | .state" | tail -n 1)
-  [ "$latest_review_state" = "APPROVED" ] && return 0
   RECORDS=$(append_line "$RECORDS" "${source}"$'\t'"${repo}"$'\t'"${number}"$'\t'"${created}"$'\t'"${age}"$'\t'"${author}"$'\t'"${title}"$'\t'"${url}")
+}
+
+flush_review_chunk() {
+  local out alias state idx key
+  [ -n "$CHUNK" ] || return 0
+  out=$(gh api graphql -f query="query {${CHUNK} }" --jq '.data | to_entries[] | [.key, (.value.pullRequest.reviews.nodes[0].state // "-")] | @tsv')
+  while IFS=$'\t' read -r alias state; do
+    [ -n "${alias:-}" ] || continue
+    [ "$state" = "APPROVED" ] || continue
+    idx=${alias#q}
+    key=$(printf '%s\n' "$CHUNK_KEYS" | sed -n "$((idx + 1))p")
+    [ -n "$key" ] || continue
+    APPROVED_KEYS=$(append_unique_line "$APPROVED_KEYS" "$key")
+  done <<EOF
+$out
+EOF
+  CHUNK=
+  CHUNK_KEYS=
+  CHUNK_COUNT=0
+}
+
+# One aliased GraphQL query per 50 unique PRs replaces a REST reviews call
+# per search hit; reviews(last: 1, author, states) yields the latest
+# APPROVED/CHANGES_REQUESTED review by the current user regardless of how
+# many reviews the PR has.
+filter_approved() {
+  [ -n "$RECORDS" ] || return 0
+  local keys= source repo number created age author title url key owner name filtered=
+
+  while IFS=$'\t' read -r source repo number created age author title url; do
+    [ -n "${source:-}" ] || continue
+    keys=$(append_unique_line "$keys" "${repo}#${number}")
+  done <<EOF
+$RECORDS
+EOF
+
+  CHUNK=
+  CHUNK_KEYS=
+  CHUNK_COUNT=0
+  APPROVED_KEYS=
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    repo=${key%"#"*}
+    number=${key##*"#"}
+    owner=${repo%%/*}
+    name=${repo#*/}
+    CHUNK="${CHUNK} q${CHUNK_COUNT}: repository(owner: \"${owner}\", name: \"${name}\") { pullRequest(number: ${number}) { reviews(last: 1, author: \"${CURRENT_USER}\", states: [APPROVED, CHANGES_REQUESTED]) { nodes { state } } } }"
+    CHUNK_KEYS=$(append_line "$CHUNK_KEYS" "$key")
+    CHUNK_COUNT=$((CHUNK_COUNT + 1))
+    [ "$CHUNK_COUNT" -lt 50 ] || flush_review_chunk
+  done <<EOF
+$keys
+EOF
+  flush_review_chunk
+
+  while IFS=$'\t' read -r source repo number created age author title url; do
+    [ -n "${source:-}" ] || continue
+    line_has "$APPROVED_KEYS" "${repo}#${number}" && continue
+    filtered=$(append_line "$filtered" "${source}"$'\t'"${repo}"$'\t'"${number}"$'\t'"${created}"$'\t'"${age}"$'\t'"${author}"$'\t'"${title}"$'\t'"${url}")
+  done <<EOF
+$RECORDS
+EOF
+  RECORDS=$filtered
 }
 
 run_search() {
@@ -407,15 +474,30 @@ EOF
   return 0
 }
 
+# Repeated author: qualifiers OR together, so each query matches only
+# teammate-authored PRs instead of scanning every open PR in the org.
+# Teammates are chunked to keep each query under QUERY_LIMIT.
 fetch_teammate() {
-  local org base
+  local org base prefix query member
   [ -n "$TEAMMATES" ] || return 0
   [ -n "$ORGS_SCOPE" ] || return 0
 
   base=$(base_query)
   while IFS= read -r org; do
     [ -n "$org" ] || continue
-    run_search teammate "${base} org:${org}"
+    prefix="${base} org:${org}"
+    query=$prefix
+    while IFS= read -r member; do
+      [ -n "$member" ] || continue
+      if [ $(( ${#query} + ${#member} + 8 )) -gt "$QUERY_LIMIT" ]; then
+        run_search teammate "$query"
+        query=$prefix
+      fi
+      query="${query} author:${member}"
+    done <<EOF
+$TEAMMATES
+EOF
+    [ "$query" = "$prefix" ] || run_search teammate "$query"
   done <<EOF
 $ORGS_SCOPE
 EOF
@@ -429,6 +511,7 @@ fetch_records() {
   priority_wants direct && fetch_direct
   priority_wants team && fetch_team
   [ -n "$TEAMMATES" ] && fetch_teammate
+  filter_approved
   return 0
 }
 
@@ -550,18 +633,41 @@ run_self_check() {
   VERBOSE=0
 
   RECORDS=
-  gh() {
-    case "$2" in
-      repos/acme/app/pulls/42/reviews) printf 'APPROVED\n' ;;
-      repos/acme/app/pulls/43/reviews) ;;
-      *) return 1 ;;
-    esac
-  }
   record_pr direct acme/app 42 2026-01-01T00:00:00Z 6 lee "Approved" https://example.invalid/42
   record_pr direct acme/app 43 2026-01-01T00:00:00Z 6 lee "Needs review" https://example.invalid/43
+  record_pr team acme/app 42 2026-01-01T00:00:00Z 6 lee "Approved dupe" https://example.invalid/42
+  GH_CALL_LOG=$(mktemp)
+  gh() {
+    printf '.' >>"$GH_CALL_LOG"
+    printf 'q0\tAPPROVED\nq1\t-\n'
+  }
+  filter_approved
   unset -f gh
-  printf '%s\n' "$RECORDS" | grep -Fq $'\t43\t' || die "self-check failed: unapproved PR was not recorded"
-  ! printf '%s\n' "$RECORDS" | grep -Fq $'\t42\t' || die "self-check failed: approved PR was not filtered"
+  [ "$(wc -c <"$GH_CALL_LOG")" -eq 1 ] || die "self-check failed: expected one batched review query"
+  rm -f "$GH_CALL_LOG"
+  printf '%s\n' "$RECORDS" | grep -Fq $'\t43\t' || die "self-check failed: unapproved PR was not kept"
+  ! printf '%s\n' "$RECORDS" | grep -Fq $'\t42\t' || die "self-check failed: approved PR was not filtered from all tiers"
+
+  TEAMMATES=$'ann\nbob'
+  ORGS_SCOPE=acme
+  ALL_PRS=1
+  INCLUDE_DRAFTS=1
+  QUERIES=
+  run_search() { QUERIES=$(append_line "$QUERIES" "$2"); }
+  fetch_teammate
+  [ "$(printf '%s\n' "$QUERIES" | grep -c .)" -eq 1 ] || die "self-check failed: short teammate list should be one query"
+  printf '%s\n' "$QUERIES" | grep -Fq 'org:acme author:ann author:bob' || die "self-check failed: teammate query missing author qualifiers"
+
+  TEAMMATES=
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    TEAMMATES=$(append_line "$TEAMMATES" "member-$(printf '%02d' "$i")")
+    i=$((i + 1))
+  done
+  QUERIES=
+  fetch_teammate
+  [ "$(printf '%s\n' "$QUERIES" | grep -c .)" -gt 1 ] || die "self-check failed: long teammate list was not chunked"
+  [ -z "$(printf '%s\n' "$QUERIES" | awk -v limit="$QUERY_LIMIT" 'length > limit')" ] || die "self-check failed: teammate query exceeds QUERY_LIMIT"
   printf 'self-check ok\n'
 }
 
